@@ -162,17 +162,35 @@ def process_videos_in_dir(input_dir, dataset_root, fps=1, augment=0, target_size
     exts = {'.mp4', '.mov', '.avi', '.mkv'}
     processed = 0
     skipped = 0
-    for p in sorted(input_dir.iterdir()):
-        if p.is_file() and p.suffix.lower() in exts:
-            out = dataset_root / p.stem
-            # Skip if already has images
-            if out.exists() and any(out.glob('*.png')):
-                print(f"Skipping {p.name}, output already exists: {out}")
+    # If input_dir has subdirectories, treat each subdir as a label and process videos inside
+    subdirs = [p for p in sorted(input_dir.iterdir()) if p.is_dir()]
+    if subdirs:
+        for d in subdirs:
+            out = dataset_root / d.name
+            out.mkdir(parents=True, exist_ok=True)
+            any_video = False
+            for v in sorted(d.iterdir()):
+                if v.is_file() and v.suffix.lower() in exts:
+                    any_video = True
+                    saved = process_video(v, out, fps=fps, target_size=target_size, augment=augment)
+                    print(f"Processed {d.name}/{v.name} -> saved {saved} frames")
+                    processed += 1
+            if not any_video:
+                print(f"No videos found in subdir: {d}")
                 skipped += 1
-                continue
-            saved = process_video(p, out, fps=fps, target_size=target_size, augment=augment)
-            print(f"Processed {p.name} -> saved {saved} frames")
-            processed += 1
+    else:
+        # No subdirectories: treat files in input_dir as individual labeled videos
+        for p in sorted(input_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in exts:
+                out = dataset_root / p.stem
+                # Skip if already has images
+                if out.exists() and any(out.glob('*.png')):
+                    print(f"Skipping {p.name}, output already exists: {out}")
+                    skipped += 1
+                    continue
+                saved = process_video(p, out, fps=fps, target_size=target_size, augment=augment)
+                print(f"Processed {p.name} -> saved {saved} frames")
+                processed += 1
     print(f"process_videos_in_dir: processed={processed} skipped={skipped}")
     return processed, skipped
 
