@@ -3,6 +3,19 @@ import cv2
 import os
 import numpy as np
 from pathlib import Path
+import argparse
+import random
+import math
+
+# Optional imports for training
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    import torchvision.transforms as T
+except Exception:
+    torch = None
 
 
 def _augment_image(img):
@@ -128,6 +141,203 @@ def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
 
 
 if __name__ == "__main__":
-    # Example usage (uncomment and adapt paths):
-    # process_video("videos/amoxicillin.mp4", "dataset/amoxicillin", fps=1, target_size=(32,128), augment=2)
-    pass
+    parser = argparse.ArgumentParser(description="Preprocess video frames and/or train a simple OCR classifier.")
+    sub = parser.add_subparsers(dest="cmd", required=False)
+
+    p_pre = sub.add_parser("preprocess", help="Extract frames from videos into dataset folders")
+    p_pre.add_argument("video", help="Path to input video file")
+    p_pre.add_argument("out", help="Output directory for processed frames (folder name used as label)")
+    p_pre.add_argument("--fps", type=float, default=1.0)
+    p_pre.add_argument("--augment", type=int, default=0, help="Number of augmentations per frame")
+
+    p_train = sub.add_parser("train", help="Train a simple classifier on a dataset root")
+    p_train.add_argument("dataset_root", help="Path to dataset root (each subfolder=label or CSVs)")
+    p_train.add_argument("--epochs", type=int, default=10)
+    p_train.add_argument("--batch-size", type=int, default=32)
+    p_train.add_argument("--lr", type=float, default=1e-3)
+    p_train.add_argument("--device", default="cuda" if torch and torch.cuda.is_available() else "cpu")
+    p_train.add_argument("--val-split", type=float, default=0.1, help="Fraction for validation set")
+    p_train.add_argument("--test-split", type=float, default=0.1, help="Fraction for test set")
+
+    args = parser.parse_args()
+
+    if args.cmd == "preprocess":
+        process_video(args.video, args.out, fps=args.fps, target_size=(32, 128), augment=args.augment)
+        print("Preprocessing completed.")
+        exit(0)
+
+    if args.cmd == "train":
+        if torch is None:
+            raise RuntimeError("PyTorch not installed. Install packages from requirements.txt before training.")
+
+        # Build dataset index
+        def build_index(root):
+            root = Path(root)
+            items = []
+            # If there are CSV files in label folders, prefer those
+            for subdir in sorted(p for p in root.iterdir() if p.is_dir()):
+                csvf = subdir / "labels.csv"
+                if csvf.exists():
+                    with open(csvf, newline='', encoding='utf-8') as f:
+                        r = csv.reader(f)
+                        header = next(r, None)
+                        for row in r:
+                            if not row:
+                                continue
+                            fname = row[0]
+                            label = row[1] if len(row) > 1 else subdir.name
+                            path = subdir / fname
+                            if path.exists():
+                                items.append((str(path), label))
+                else:
+                    # fallback: all image files in folder
+                    for img in subdir.glob("*.png"):
+                        items.append((str(img), subdir.name))
+            return items
+
+        items = build_index(args.dataset_root)
+        if len(items) == 0:
+            raise RuntimeError("No dataset images found under " + str(args.dataset_root))
+
+        # label -> idx
+        labels = sorted({lab for _, lab in items})
+        label_to_idx = {lab: i for i, lab in enumerate(labels)}
+
+        random.shuffle(items)
+        n = len(items)
+        n_test = max(1, int(math.floor(n * args.test_split)))
+        n_val = max(1, int(math.floor(n * args.val_split)))
+        n_train = n - n_val - n_test
+        train_items = items[:n_train]
+        val_items = items[n_train:n_train + n_val]
+        test_items = items[n_train + n_val:]
+
+        print(f"Dataset: {n} images — train={len(train_items)}, val={len(val_items)}, test={len(test_items)} — classes={len(labels)}")
+
+        class OCRDataset(Dataset):
+            def __init__(self, items, label_to_idx, transform=None):
+                self.items = items
+                self.label_to_idx = label_to_idx
+                self.transform = transform
+
+            def __len__(self):
+                return len(self.items)
+
+            def __getitem__(self, idx):
+                path, label = self.items[idx]
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    raise RuntimeError(f"Failed to read image {path}")
+                # ensure target size
+                img = cv2.resize(img, (128, 32), interpolation=cv2.INTER_AREA)
+                # convert to 1xHxW float tensor
+                if self.transform:
+                    img = self.transform(img)
+                else:
+                    img = torch.from_numpy(img).unsqueeze(0).float() / 255.0
+                return img, self.label_to_idx[label]
+
+        # simple transforms
+        def numpy_to_tensor(img):
+            return torch.from_numpy(img).unsqueeze(0).float() / 255.0
+
+        train_ds = OCRDataset(train_items, label_to_idx, transform=numpy_to_tensor)
+        val_ds = OCRDataset(val_items, label_to_idx, transform=numpy_to_tensor)
+        test_ds = OCRDataset(test_items, label_to_idx, transform=numpy_to_tensor)
+
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+        device = torch.device(args.device)
+
+        # Simple CNN classifier
+        class SimpleCNN(nn.Module):
+            def __init__(self, n_classes):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Conv2d(1, 32, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    nn.Conv2d(32, 64, 3, padding=1),
+                    nn.ReLU(),
+                    nn.MaxPool2d(2),
+                    nn.Conv2d(64, 128, 3, padding=1),
+                    nn.ReLU(),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(),
+                    nn.Linear(128, n_classes)
+                )
+
+            def forward(self, x):
+                return self.net(x)
+
+        model = SimpleCNN(len(labels)).to(device)
+        opt = optim.Adam(model.parameters(), lr=args.lr)
+        crit = nn.CrossEntropyLoss()
+
+        best_val_acc = 0.0
+        for epoch in range(1, args.epochs + 1):
+            # train
+            model.train()
+            running_loss = 0.0
+            correct = 0
+            total = 0
+            for xb, yb in train_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                opt.zero_grad()
+                out = model(xb)
+                loss = crit(out, yb)
+                loss.backward()
+                opt.step()
+                running_loss += loss.item() * xb.size(0)
+                preds = out.argmax(dim=1)
+                correct += (preds == yb).sum().item()
+                total += xb.size(0)
+            train_loss = running_loss / total
+            train_acc = correct / total
+
+            # validation
+            model.eval()
+            v_loss = 0.0
+            v_correct = 0
+            v_total = 0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device)
+                    yb = yb.to(device)
+                    out = model(xb)
+                    loss = crit(out, yb)
+                    v_loss += loss.item() * xb.size(0)
+                    preds = out.argmax(dim=1)
+                    v_correct += (preds == yb).sum().item()
+                    v_total += xb.size(0)
+            val_loss = v_loss / max(1, v_total)
+            val_acc = v_correct / max(1, v_total)
+
+            print(f"Epoch {epoch}/{args.epochs}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+
+            # checkpoint best
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save({"model_state": model.state_dict(), "labels": labels}, "best_model.pth")
+
+        # final test evaluation
+        model.eval()
+        t_correct = 0
+        t_total = 0
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                out = model(xb)
+                preds = out.argmax(dim=1)
+                t_correct += (preds == yb).sum().item()
+                t_total += xb.size(0)
+        print(f"Test accuracy: {t_correct}/{t_total} = {t_correct / max(1, t_total):.4f}")
+
+        print("Training complete. Best val acc:", best_val_acc)
+
+    else:
+        print("No command provided. Use --help for usage. Example: preprocess or train")
