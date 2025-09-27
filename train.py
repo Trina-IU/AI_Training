@@ -36,7 +36,8 @@ def _augment_image(img):
 
 
 def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
-                  sharpness_thresh=50.0, ink_ratio_range=(0.005, 0.6), augment=0):
+                  sharpness_thresh=50.0, ink_ratio_range=(0.005, 0.6), augment=0,
+                  dedupe=True, dedupe_hamming_thresh=5):
     """Extract frames from a video and prepare them for OCR training.
 
     Args:
@@ -90,6 +91,8 @@ def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
     csvw = csv.writer(writer)
 
     h_t, w_t = target_size
+    # dedupe state: store last saved aHash
+    last_hash = None
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -114,6 +117,30 @@ def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
 
             # Threshold (binarization)
             _, thresh = cv2.threshold(canvas, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # Deduplication using average hash (aHash) on the binarized canvas
+            if dedupe:
+                try:
+                    small = cv2.resize(thresh, (8, 8), interpolation=cv2.INTER_AREA)
+                    avg = small.mean()
+                    bits = (small > avg).astype(np.uint8)
+                    # pack bits into integer tuple for hamming distance
+                    # represent as bytes for quick XOR
+                    bh = 0
+                    for b in bits.flatten():
+                        bh = (bh << 1) | int(b)
+                    if last_hash is not None:
+                        x = last_hash ^ bh
+                        # popcount hamming distance
+                        ham = x.bit_count()
+                        if ham <= dedupe_hamming_thresh:
+                            # too similar to last saved frame
+                            count += 1
+                            continue
+                    last_hash = bh
+                except Exception:
+                    # fall back to no dedupe if something goes wrong
+                    pass
 
             # Basic quality checks
             sharpness = cv2.Laplacian(thresh, cv2.CV_64F).var()
@@ -310,11 +337,28 @@ if __name__ == "__main__":
         def numpy_to_tensor(img):
             return torch.from_numpy(img).unsqueeze(0).float() / 255.0
 
-        train_ds = OCRDataset(train_items, label_to_idx, transform=numpy_to_tensor)
-        val_ds = OCRDataset(val_items, label_to_idx, transform=numpy_to_tensor)
-        test_ds = OCRDataset(test_items, label_to_idx, transform=numpy_to_tensor)
+        # add simple normalization: map [0,1] -> (x-mean)/std ; use mean=0.5,std=0.5 as default
+        def normalized_tensor(img):
+            t = torch.from_numpy(img).unsqueeze(0).float() / 255.0
+            return (t - 0.5) / 0.5
 
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+        train_ds = OCRDataset(train_items, label_to_idx, transform=normalized_tensor)
+        val_ds = OCRDataset(val_items, label_to_idx, transform=normalized_tensor)
+        test_ds = OCRDataset(test_items, label_to_idx, transform=normalized_tensor)
+
+        # compute class weights for WeightedRandomSampler to reduce class imbalance
+        counts = {}
+        for _, lab in train_items:
+            counts[lab] = counts.get(lab, 0) + 1
+        class_weights = {lab: 1.0 / counts[lab] for lab in counts}
+        sample_weights = [class_weights[lab] for _, lab in train_items]
+        try:
+            from torch.utils.data import WeightedRandomSampler
+            sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+            train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
+        except Exception:
+            # fallback to simple shuffling if sampler unavailable
+            train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
