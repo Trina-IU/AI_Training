@@ -60,14 +60,25 @@ def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
     label = output_dir.name
     labels_csv = output_dir / "labels.csv"
 
+    # Check file exists
+    video_path = Path(video_path)
+    if not video_path.exists():
+        print(f"Error: video file not found: {video_path} (cwd={Path.cwd()})")
+        return 0
+
     # Open video
     cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f"Error: OpenCV couldn't open the video file: {video_path}")
+        return 0
+
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     if video_fps <= 0:
         # fallback if FPS couldn't be read
         video_fps = 30.0
 
     frame_interval = max(1, int(round(video_fps / float(max(1, fps)))))
+    print(f"Video opened: {video_path} fps={video_fps:.2f} sample_fps={fps} frame_interval={frame_interval}")
 
     count, saved = 0, 0
     writer = None
@@ -138,6 +149,32 @@ def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
     cap.release()
     writer.close()
     print(f"Extracted & processed {saved} frames → {output_dir}")
+    return saved
+
+
+def process_videos_in_dir(input_dir, dataset_root, fps=1, augment=0, target_size=(32,128)):
+    """Process all videos in input_dir. Each video becomes a subfolder of dataset_root named after the filename stem."""
+    input_dir = Path(input_dir)
+    dataset_root = Path(dataset_root)
+    if not input_dir.exists() or not input_dir.is_dir():
+        raise RuntimeError(f"Input directory does not exist: {input_dir}")
+    dataset_root.mkdir(parents=True, exist_ok=True)
+    exts = {'.mp4', '.mov', '.avi', '.mkv'}
+    processed = 0
+    skipped = 0
+    for p in sorted(input_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in exts:
+            out = dataset_root / p.stem
+            # Skip if already has images
+            if out.exists() and any(out.glob('*.png')):
+                print(f"Skipping {p.name}, output already exists: {out}")
+                skipped += 1
+                continue
+            saved = process_video(p, out, fps=fps, target_size=target_size, augment=augment)
+            print(f"Processed {p.name} -> saved {saved} frames")
+            processed += 1
+    print(f"process_videos_in_dir: processed={processed} skipped={skipped}")
+    return processed, skipped
 
 
 if __name__ == "__main__":
@@ -159,6 +196,18 @@ if __name__ == "__main__":
     p_train.add_argument("--val-split", type=float, default=0.1, help="Fraction for validation set")
     p_train.add_argument("--test-split", type=float, default=0.1, help="Fraction for test set")
 
+    p_pipe = sub.add_parser("pipeline", help="Process all videos in a folder and then train end-to-end")
+    p_pipe.add_argument("input_dir", help="Directory containing videos to process")
+    p_pipe.add_argument("dataset_root", help="Directory where processed dataset subfolders will be created")
+    p_pipe.add_argument("--fps", type=float, default=1.0)
+    p_pipe.add_argument("--augment", type=int, default=0)
+    p_pipe.add_argument("--epochs", type=int, default=10)
+    p_pipe.add_argument("--batch-size", type=int, default=32)
+    p_pipe.add_argument("--lr", type=float, default=1e-3)
+    p_pipe.add_argument("--device", default="cuda" if torch and torch.cuda.is_available() else "cpu")
+    p_pipe.add_argument("--val-split", type=float, default=0.1, help="Fraction for validation set")
+    p_pipe.add_argument("--test-split", type=float, default=0.1, help="Fraction for test set")
+
     args = parser.parse_args()
 
     if args.cmd == "preprocess":
@@ -166,7 +215,7 @@ if __name__ == "__main__":
         print("Preprocessing completed.")
         exit(0)
 
-    if args.cmd == "train":
+    def run_training(dataset_root, epochs=10, batch_size=32, lr=1e-3, device_str="cpu", val_split=0.1, test_split=0.1):
         if torch is None:
             raise RuntimeError("PyTorch not installed. Install packages from requirements.txt before training.")
 
@@ -195,9 +244,9 @@ if __name__ == "__main__":
                         items.append((str(img), subdir.name))
             return items
 
-        items = build_index(args.dataset_root)
+        items = build_index(dataset_root)
         if len(items) == 0:
-            raise RuntimeError("No dataset images found under " + str(args.dataset_root))
+            raise RuntimeError("No dataset images found under " + str(dataset_root))
 
         # label -> idx
         labels = sorted({lab for _, lab in items})
@@ -205,8 +254,8 @@ if __name__ == "__main__":
 
         random.shuffle(items)
         n = len(items)
-        n_test = max(1, int(math.floor(n * args.test_split)))
-        n_val = max(1, int(math.floor(n * args.val_split)))
+        n_test = max(1, int(math.floor(n * test_split)))
+        n_val = max(1, int(math.floor(n * val_split)))
         n_train = n - n_val - n_test
         train_items = items[:n_train]
         val_items = items[n_train:n_train + n_val]
@@ -245,11 +294,11 @@ if __name__ == "__main__":
         val_ds = OCRDataset(val_items, label_to_idx, transform=numpy_to_tensor)
         test_ds = OCRDataset(test_items, label_to_idx, transform=numpy_to_tensor)
 
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        device = torch.device(args.device)
+        device = torch.device(device_str)
 
         # Simple CNN classifier
         class SimpleCNN(nn.Module):
@@ -273,11 +322,11 @@ if __name__ == "__main__":
                 return self.net(x)
 
         model = SimpleCNN(len(labels)).to(device)
-        opt = optim.Adam(model.parameters(), lr=args.lr)
+        opt = optim.Adam(model.parameters(), lr=lr)
         crit = nn.CrossEntropyLoss()
 
         best_val_acc = 0.0
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(1, epochs + 1):
             # train
             model.train()
             running_loss = 0.0
@@ -316,7 +365,7 @@ if __name__ == "__main__":
             val_loss = v_loss / max(1, v_total)
             val_acc = v_correct / max(1, v_total)
 
-            print(f"Epoch {epoch}/{args.epochs}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+            print(f"Epoch {epoch}/{epochs}: train_loss={train_loss:.4f} train_acc={train_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
 
             # checkpoint best
             if val_acc > best_val_acc:
@@ -338,6 +387,20 @@ if __name__ == "__main__":
         print(f"Test accuracy: {t_correct}/{t_total} = {t_correct / max(1, t_total):.4f}")
 
         print("Training complete. Best val acc:", best_val_acc)
+
+    # train command now calls run_training
+    if args.cmd == "train":
+        run_training(args.dataset_root, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+                     device_str=args.device, val_split=args.val_split, test_split=args.test_split)
+
+    # pipeline: preprocess all videos in input_dir then train
+    if args.cmd == "pipeline":
+        processed, skipped = process_videos_in_dir(args.input_dir, args.dataset_root, fps=args.fps, augment=args.augment)
+        if processed == 0:
+            print("No videos processed. Exiting.")
+        else:
+            run_training(args.dataset_root, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+                         device_str=args.device, val_split=args.val_split, test_split=args.test_split)
 
     else:
         print("No command provided. Use --help for usage. Example: preprocess or train")
