@@ -212,6 +212,7 @@ if __name__ == "__main__":
     p_train.add_argument("--lr", type=float, default=1e-3)
     p_train.add_argument("--device", default="cuda" if torch and torch.cuda.is_available() else "cpu")
     p_train.add_argument("--val-split", type=float, default=0.1, help="Fraction for validation set")
+    p_train.add_argument("--model", choices=["simple_cnn", "resnet18"], default="simple_cnn", help="CNN architecture to use")
     p_train.add_argument("--test-split", type=float, default=0.1, help="Fraction for test set")
 
     p_pipe = sub.add_parser("pipeline", help="Process all videos in a folder and then train end-to-end")
@@ -225,6 +226,7 @@ if __name__ == "__main__":
     p_pipe.add_argument("--device", default="cuda" if torch and torch.cuda.is_available() else "cpu")
     p_pipe.add_argument("--val-split", type=float, default=0.1, help="Fraction for validation set")
     p_pipe.add_argument("--test-split", type=float, default=0.1, help="Fraction for test set")
+    p_pipe.add_argument("--model", choices=["simple_cnn", "resnet18"], default="simple_cnn", help="CNN architecture to use")
 
     args = parser.parse_args()
 
@@ -233,7 +235,7 @@ if __name__ == "__main__":
         print("Preprocessing completed.")
         exit(0)
 
-    def run_training(dataset_root, epochs=10, batch_size=32, lr=1e-3, device_str="cpu", val_split=0.1, test_split=0.1):
+    def run_training(dataset_root, epochs=10, batch_size=32, lr=1e-3, device_str="cpu", val_split=0.1, test_split=0.1, model_name="simple_cnn"):
         if torch is None:
             raise RuntimeError("PyTorch not installed. Install packages from requirements.txt before training.")
 
@@ -318,28 +320,43 @@ if __name__ == "__main__":
 
         device = torch.device(device_str)
 
-        # Simple CNN classifier
-        class SimpleCNN(nn.Module):
-            def __init__(self, n_classes):
-                super().__init__()
-                self.net = nn.Sequential(
-                    nn.Conv2d(1, 32, 3, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2),
-                    nn.Conv2d(32, 64, 3, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(2),
-                    nn.Conv2d(64, 128, 3, padding=1),
-                    nn.ReLU(),
-                    nn.AdaptiveAvgPool2d((1, 1)),
-                    nn.Flatten(),
-                    nn.Linear(128, n_classes)
-                )
+        # Build model
+        if model_name == "resnet18":
+            try:
+                from torchvision import models
+                # ResNet expects 3-channel input; expand conv1 to accept 1 channel
+                model = models.resnet18(weights=None)
+                # replace first conv to accept 1 channel
+                model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+                model.fc = nn.Linear(model.fc.in_features, len(labels))
+                model = model.to(device)
+            except Exception:
+                print("Warning: torchvision/resnet not available — falling back to simple_cnn")
+                model_name = "simple_cnn"
 
-            def forward(self, x):
-                return self.net(x)
+        if model_name == "simple_cnn":
+            # Simple CNN classifier
+            class SimpleCNN(nn.Module):
+                def __init__(self, n_classes):
+                    super().__init__()
+                    self.net = nn.Sequential(
+                        nn.Conv2d(1, 32, 3, padding=1),
+                        nn.ReLU(),
+                        nn.MaxPool2d(2),
+                        nn.Conv2d(32, 64, 3, padding=1),
+                        nn.ReLU(),
+                        nn.MaxPool2d(2),
+                        nn.Conv2d(64, 128, 3, padding=1),
+                        nn.ReLU(),
+                        nn.AdaptiveAvgPool2d((1, 1)),
+                        nn.Flatten(),
+                        nn.Linear(128, n_classes)
+                    )
 
-        model = SimpleCNN(len(labels)).to(device)
+                def forward(self, x):
+                    return self.net(x)
+
+            model = SimpleCNN(len(labels)).to(device)
         opt = optim.Adam(model.parameters(), lr=lr)
         crit = nn.CrossEntropyLoss()
 
