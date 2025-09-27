@@ -37,7 +37,7 @@ def _augment_image(img):
 
 def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
                   sharpness_thresh=50.0, ink_ratio_range=(0.005, 0.6), augment=0,
-                  dedupe=True, dedupe_hamming_thresh=5):
+                  dedupe=True, dedupe_hamming_thresh=8, max_frames_per_video=None):
     """Extract frames from a video and prepare them for OCR training.
 
     Args:
@@ -142,6 +142,11 @@ def process_video(video_path, output_dir, fps=1, target_size=(32, 128),
                     # fall back to no dedupe if something goes wrong
                     pass
 
+            # respect per-video maximum
+            if max_frames_per_video is not None and saved >= int(max_frames_per_video):
+                # reached cap for this video
+                break
+
             # Basic quality checks
             sharpness = cv2.Laplacian(thresh, cv2.CV_64F).var()
             ink_ratio = float((thresh < 128).mean())
@@ -231,6 +236,9 @@ if __name__ == "__main__":
     p_pre.add_argument("out", help="Output directory for processed frames (folder name used as label)")
     p_pre.add_argument("--fps", type=float, default=1.0)
     p_pre.add_argument("--augment", type=int, default=0, help="Number of augmentations per frame")
+    p_pre.add_argument("--no-dedupe", dest="dedupe", action="store_false", help="Disable deduplication during preprocessing")
+    p_pre.add_argument("--dedupe-thresh", dest="dedupe_thresh", type=int, default=8, help="Hamming threshold for dedupe (higher keeps more frames)")
+    p_pre.add_argument("--max-frames-per-video", dest="max_frames", type=int, default=None, help="Cap saved frames per video")
 
     p_train = sub.add_parser("train", help="Train a simple classifier on a dataset root")
     p_train.add_argument("dataset_root", help="Path to dataset root (each subfolder=label or CSVs)")
@@ -247,6 +255,9 @@ if __name__ == "__main__":
     p_pipe.add_argument("dataset_root", help="Directory where processed dataset subfolders will be created")
     p_pipe.add_argument("--fps", type=float, default=1.0)
     p_pipe.add_argument("--augment", type=int, default=0)
+    p_pipe.add_argument("--no-dedupe", dest="dedupe", action="store_false", help="Disable deduplication during preprocessing")
+    p_pipe.add_argument("--dedupe-thresh", dest="dedupe_thresh", type=int, default=8, help="Hamming threshold for dedupe (higher keeps more frames)")
+    p_pipe.add_argument("--max-frames-per-video", dest="max_frames", type=int, default=None, help="Cap saved frames per video")
     p_pipe.add_argument("--epochs", type=int, default=10)
     p_pipe.add_argument("--batch-size", type=int, default=32)
     p_pipe.add_argument("--lr", type=float, default=1e-3)
@@ -258,7 +269,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.cmd == "preprocess":
-        process_video(args.video, args.out, fps=args.fps, target_size=(32, 128), augment=args.augment)
+        process_video(args.video, args.out, fps=args.fps, target_size=(32, 128), augment=args.augment,
+                      dedupe=args.dedupe, dedupe_hamming_thresh=args.dedupe_thresh, max_frames_per_video=args.max_frames)
         print("Preprocessing completed.")
         exit(0)
 
@@ -474,12 +486,18 @@ if __name__ == "__main__":
 
     # pipeline: preprocess all videos in input_dir then train
     if args.cmd == "pipeline":
-        processed, skipped = process_videos_in_dir(args.input_dir, args.dataset_root, fps=args.fps, augment=args.augment)
+        # optionally clear dataset root if --force
+        if getattr(args, 'force', False):
+            import shutil
+            if Path(args.dataset_root).exists():
+                shutil.rmtree(args.dataset_root)
+        processed, skipped = process_videos_in_dir(args.input_dir, args.dataset_root, fps=args.fps, augment=args.augment,
+                                                  target_size=(32,128))
         if processed == 0:
             print("No videos processed. Exiting.")
         else:
             run_training(args.dataset_root, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
-                         device_str=args.device, val_split=args.val_split, test_split=args.test_split)
+                         device_str=args.device, val_split=args.val_split, test_split=args.test_split, model_name=args.model)
 
     else:
         print("No command provided. Use --help for usage. Example: preprocess or train")
