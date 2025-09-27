@@ -17,8 +17,20 @@ try:
     from torch.utils.data import Dataset, DataLoader
     from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 except Exception:
-    # torch not available
+    # torch not available — create lightweight stubs so module can be imported
     torch = None
+    # minimal nn stub so classes can be defined (won't be functional for training)
+    class _NNStub:
+        class Module:
+            pass
+    nn = _NNStub()
+    # other torch-related placeholders
+    optim = None
+    F = None
+    Dataset = object
+    DataLoader = list
+    ReduceLROnPlateau = None
+    StepLR = None
 
 # torchvision is optional; keep torch usable if torchvision is missing
 try:
@@ -205,7 +217,8 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
 
     cap.release()
     writer.close()
-    print(f"Extracted & processed {saved} frames → {output_dir}")
+    # Avoid printing Unicode characters that may not be supported on some Windows consoles
+    print("Extracted & processed {} frames -> {}".format(saved, output_dir))
     return saved
 
 
