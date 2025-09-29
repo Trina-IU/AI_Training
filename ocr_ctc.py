@@ -192,8 +192,31 @@ def train(args):
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
 
     best_loss = 1e9
+    start_epoch = 1
+    no_improve = 0
 
-    for epoch in range(1, args.epochs + 1):
+    # Resume from checkpoint if provided
+    if getattr(args, 'resume_from', None):
+        resume_path = Path(args.resume_from)
+        if resume_path.exists():
+            print('Resuming from', str(resume_path))
+            ck = torch.load(str(resume_path), map_location='cpu')
+            if 'model_state_dict' in ck:
+                model.load_state_dict(ck['model_state_dict'])
+            if 'optimizer_state_dict' in ck:
+                try:
+                    optimizer.load_state_dict(ck['optimizer_state_dict'])
+                except Exception:
+                    print('Warning: failed to fully load optimizer state; continuing with fresh optimizer')
+            if 'val_loss' in ck:
+                best_loss = ck.get('val_loss', best_loss)
+            if 'epoch' in ck:
+                start_epoch = int(ck.get('epoch', 0)) + 1
+            print(f"  start_epoch={start_epoch}, best_loss={best_loss}")
+        else:
+            print('Warning: resume-from path not found:', str(resume_path))
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
         total_loss = 0.0
@@ -234,18 +257,42 @@ def train(args):
         val_loss = val_loss / (len(val_loader) if len(val_loader)>0 else 1)
         print(f"  Validation loss: {val_loss:.4f}")
 
+
+        # Save 'last' checkpoint every epoch (includes optimizer state)
+        last_ck = {
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'char_map': char_map,
+            'idx_to_char': idx_to_char,
+            'val_loss': val_loss,
+            'epoch': epoch,
+            'model_name': 'crnn_ctc'
+        }
+        try:
+            torch.save(last_ck, str(Path(args.save_path).with_suffix('.last.pth')))
+        except Exception:
+            # non-fatal
+            pass
+
         # Save best
         if val_loss < best_loss:
             best_loss = val_loss
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'char_map': char_map,
-                'idx_to_char': idx_to_char,
-                'val_loss': val_loss,
-                'epoch': epoch,
-                'model_name': 'crnn_ctc'
-            }, args.save_path)
-            print(f"  Saved best model to {args.save_path}")
+            no_improve = 0
+            best_ck = last_ck.copy()
+            try:
+                torch.save(best_ck, args.save_path)
+                print(f"  Saved best model to {args.save_path}")
+            except Exception as e:
+                print('Warning: failed to save best model:', e)
+        else:
+            no_improve += 1
+            print(f"  No improvement for {no_improve} epoch(s)")
+
+        # Early stopping
+        if getattr(args, 'patience', None) is not None and args.patience > 0:
+            if no_improve >= args.patience:
+                print(f"Stopping early after {no_improve} epochs with no improvement (patience={args.patience})")
+                break
 
     print('Training complete')
 
@@ -262,6 +309,8 @@ if __name__ == '__main__':
     p.add_argument('--val-split', type=float, default=0.15)
     p.add_argument('--test-split', type=float, default=0.15)
     p.add_argument('--save-path', default='best_crnn_ctc.pth')
+    p.add_argument('--resume-from', default=None, help='Path to checkpoint to resume (loads optimizer state if present)')
+    p.add_argument('--patience', type=int, default=0, help='Early stopping patience in epochs (0 = disabled)')
     args = p.parse_args()
 
     train(args)
