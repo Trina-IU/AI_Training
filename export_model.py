@@ -27,6 +27,8 @@ class CRNN(nn.Module):
 
     def forward(self, x):
         conv = self.cnn(x)
+        # collapse height dimension
+        conv = nn.functional.adaptive_avg_pool2d(conv, (1, conv.size(3)))
         b, c, h, w = conv.size()
         conv = conv.view(b, c * h, w).permute(0, 2, 1)
         out, _ = self.rnn(conv)

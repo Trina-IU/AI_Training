@@ -2,6 +2,7 @@ import argparse
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import cv2
 import numpy as np
 import numpy as np
@@ -37,6 +38,7 @@ class CRNN(nn.Module):
 
     def forward(self, x):
         conv = self.cnn(x)
+        conv = F.adaptive_avg_pool2d(conv, (1, conv.size(3)))
         b, c, h, w = conv.size()
         conv = conv.view(b, c * h, w).permute(0, 2, 1)
         out, _ = self.rnn(conv)

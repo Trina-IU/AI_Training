@@ -23,6 +23,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -146,6 +147,9 @@ class CRNN(nn.Module):
     def forward(self, x):
         # x: [B,1,H,W]
         conv = self.cnn(x)  # [B,C,H',W']
+        # collapse height to 1 so sequence features per timestep = channels
+        # result: [B, C, 1, W']
+        conv = F.adaptive_avg_pool2d(conv, (1, conv.size(3)))
         b, c, h, w = conv.size()
         conv = conv.view(b, c * h, w).permute(0, 2, 1)  # [B, W', C*H'] -> sequence
         out, _ = self.rnn(conv)  # [B, W', 512]
