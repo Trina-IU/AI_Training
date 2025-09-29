@@ -50,6 +50,24 @@ def build_index(root: Path):
     return items
 
 
+def imread_unicode(path, flags=cv2.IMREAD_GRAYSCALE):
+    """Read image robustly on Windows with non-ASCII paths.
+    Try cv2.imread first; on failure fall back to numpy.fromfile + cv2.imdecode.
+    Returns None on failure.
+    """
+    img = cv2.imread(path, flags)
+    if img is not None:
+        return img
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        if data.size == 0:
+            return None
+        img = cv2.imdecode(data, flags)
+        return img
+    except Exception:
+        return None
+
+
 def build_charset(items):
     chars = set()
     for _, t in items:
@@ -77,7 +95,7 @@ class OCRCTCDataset(Dataset):
 
     def __getitem__(self, idx):
         path, transcript = self.items[idx]
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        img = imread_unicode(path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise RuntimeError("Failed to read " + path)
         img = cv2.resize(img, (self.target_size[1], self.target_size[0]), interpolation=cv2.INTER_AREA)

@@ -4,6 +4,21 @@ import torch
 import torch.nn as nn
 import cv2
 import numpy as np
+import numpy as np
+
+
+def imread_unicode(path, flags=cv2.IMREAD_GRAYSCALE):
+    img = cv2.imread(str(path), flags)
+    if img is not None:
+        return img
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+        if data.size == 0:
+            return None
+        img = cv2.imdecode(data, flags)
+        return img
+    except Exception:
+        return None
 
 # Reconstruct minimal CRNN from ocr_ctc.py
 class CRNN(nn.Module):
@@ -31,7 +46,7 @@ class CRNN(nn.Module):
 
 
 def preprocess(path, target_size=(64,256)):
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    img = imread_unicode(path, cv2.IMREAD_GRAYSCALE)
     img = cv2.resize(img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
     img = img.astype('float32') / 255.0
     img = (img - 0.5) / 0.5
