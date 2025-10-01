@@ -15,28 +15,10 @@ try:
     import torch.optim as optim
     import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
+    import torchvision.transforms as T
     from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 except Exception:
-    # torch not available — create lightweight stubs so module can be imported
     torch = None
-    # minimal nn stub so classes can be defined (won't be functional for training)
-    class _NNStub:
-        class Module:
-            pass
-    nn = _NNStub()
-    # other torch-related placeholders
-    optim = None
-    F = None
-    Dataset = object
-    DataLoader = list
-    ReduceLROnPlateau = None
-    StepLR = None
-
-# torchvision is optional; keep torch usable if torchvision is missing
-try:
-    import torchvision.transforms as T
-except Exception:
-    T = None
 
 
 def _augment_image(img):
@@ -78,14 +60,17 @@ def _augment_image(img):
     return out
 
 
-def enhanced_preprocess_image(img, target_size=(64, 256)):
+def enhanced_preprocess_image(img, target_size=(64, 256), skip_blur=False):
     """Enhanced preprocessing specifically for handwriting recognition."""
     h, w = img.shape
     h_t, w_t = target_size
 
     # Adaptive thresholding for better binarization of handwriting
     # First, apply Gaussian blur to reduce noise
-    blurred = cv2.GaussianBlur(img, (3, 3), 0)
+    if skip_blur:
+        blurred = img
+    else:
+        blurred = cv2.GaussianBlur(img, (3, 3), 0)
 
     # Use adaptive threshold instead of OTSU for handwriting
     thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -110,8 +95,9 @@ def enhanced_preprocess_image(img, target_size=(64, 256)):
 
 
 def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
-                  sharpness_thresh=30.0, ink_ratio_range=(0.01, 0.7), augment=0,
-                  dedupe=True, dedupe_hamming_thresh=12, max_frames_per_video=None):
+                  sharpness_thresh=10.0, ink_ratio_range=(0.005, 0.8), augment=0,
+                  dedupe=True, dedupe_hamming_thresh=12, max_frames_per_video=None, debug=False,
+                  video_prefix=None, save_original=False, skip_blur=False):
     """Enhanced video processing for handwriting OCR with better preprocessing."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,7 +117,7 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
     if not cap.isOpened():
         print(f"Error: OpenCV couldn't open the video file: {video_path}")
         return 0
-
+    # Get video FPS and compute sampling interval
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_interval = max(1, int(round(video_fps / float(max(1, fps)))))
     print(f"Video opened: {video_path} fps={video_fps:.2f} sample_fps={fps} frame_interval={frame_interval}")
@@ -148,6 +134,7 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
     h_t, w_t = target_size
     last_hash = None
 
+    # Read frames
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -157,8 +144,20 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
             # Convert to grayscale
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Enhanced preprocessing
-            processed = enhanced_preprocess_image(gray, target_size)
+            # Enhanced preprocessing (optionally skip the blur)
+            processed = enhanced_preprocess_image(gray, target_size, skip_blur=skip_blur)
+
+            # Optionally save the raw grayscale (resized) for human inspection
+            if save_original:
+                try:
+                    # resize grayscale to target for consistency
+                    orig = cv2.resize(gray, (w_t, h_t), interpolation=cv2.INTER_AREA)
+                    orig_name = f"{vp}_orig_{saved:05d}.png"
+                    orig_path = output_dir / orig_name
+                    cv2.imwrite(str(orig_path), orig)
+                    # Do not write to labels.csv for originals to keep training data unchanged
+                except Exception:
+                    pass
 
             # Deduplication using improved hashing
             if dedupe:
@@ -194,8 +193,20 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
                 count += 1
                 continue
 
-            # Save processed frame
-            base_name = f"frame_{saved:05d}.png"
+            # Save processed frame. Prefer an explicit video_prefix; if not provided
+            # use the source video's filename stem so frames are grouped by source
+            # video (avoid using the output directory name, which confuses test runs).
+            try:
+                src_stem = video_path.stem
+            except Exception:
+                src_stem = None
+            if video_prefix:
+                vp = video_prefix
+            elif src_stem:
+                vp = src_stem
+            else:
+                vp = output_dir.name
+            base_name = f"{vp}_frame_{saved:05d}.png"
             filepath = output_dir / base_name
             cv2.imwrite(str(filepath), processed)
             csvw.writerow([str(filepath.name), label])
@@ -207,7 +218,7 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
                 # Save more augmentations but limit to prevent overfitting
                 max_aug = min(augment, len(aug_images) - 1)
                 for i, aug_img in enumerate(aug_images[1:max_aug+1], start=1):
-                    aug_name = f"frame_{saved:05d}_aug{i}.png"
+                    aug_name = f"{vp}_frame_{saved:05d}_aug{i}.png"
                     aug_path = output_dir / aug_name
                     cv2.imwrite(str(aug_path), aug_img)
                     csvw.writerow([str(aug_path.name), label])
@@ -217,13 +228,14 @@ def process_video(video_path, output_dir, fps=1, target_size=(64, 256),
 
     cap.release()
     writer.close()
-    # Avoid printing Unicode characters that may not be supported on some Windows consoles
-    print("Extracted & processed {} frames -> {}".format(saved, output_dir))
+    print(f"Extracted & processed {saved} frames → {output_dir}")
     return saved
 
 
 def process_videos_in_dir(input_dir, dataset_root, fps=1, augment=0, target_size=(64, 256),
-                          dedupe=True, dedupe_hamming_thresh=12, max_frames_per_video=None):
+                          dedupe=True, dedupe_hamming_thresh=12, max_frames_per_video=None,
+                          sharpness_thresh=10.0, ink_ratio_range=(0.005, 0.8), debug=False,
+                          save_original=False, skip_blur=False):
     """Process all videos with enhanced target size for handwriting."""
     input_dir = Path(input_dir)
     dataset_root = Path(dataset_root)
@@ -243,10 +255,22 @@ def process_videos_in_dir(input_dir, dataset_root, fps=1, augment=0, target_size
             for v in sorted(d.iterdir()):
                 if v.is_file() and v.suffix.lower() in exts:
                     any_video = True
-                    saved = process_video(v, out, fps=fps, target_size=target_size,
-                                          augment=augment, dedupe=dedupe,
-                                          dedupe_hamming_thresh=dedupe_hamming_thresh,
-                                          max_frames_per_video=max_frames_per_video)
+                    saved = process_video(
+                        v,
+                        out,
+                        fps=fps,
+                        target_size=target_size,
+                        augment=augment,
+                        dedupe=dedupe,
+                        dedupe_hamming_thresh=dedupe_hamming_thresh,
+                        max_frames_per_video=max_frames_per_video,
+                        sharpness_thresh=sharpness_thresh,
+                        ink_ratio_range=ink_ratio_range,
+                            debug=debug,
+                            video_prefix=v.stem,
+                            save_original=save_original,
+                            skip_blur=skip_blur,
+                    )
                     print(f"Processed {d.name}/{v.name} -> saved {saved} frames")
                     processed += 1
             if not any_video:
@@ -260,10 +284,22 @@ def process_videos_in_dir(input_dir, dataset_root, fps=1, augment=0, target_size
                     print(f"Skipping {p.name}, output already exists: {out}")
                     skipped += 1
                     continue
-                saved = process_video(p, out, fps=fps, target_size=target_size,
-                                      augment=augment, dedupe=dedupe,
-                                      dedupe_hamming_thresh=dedupe_hamming_thresh,
-                                      max_frames_per_video=max_frames_per_video)
+                saved = process_video(
+                    p,
+                    out,
+                    fps=fps,
+                    target_size=target_size,
+                    augment=augment,
+                    dedupe=dedupe,
+                    dedupe_hamming_thresh=dedupe_hamming_thresh,
+                    max_frames_per_video=max_frames_per_video,
+                    sharpness_thresh=sharpness_thresh,
+                    ink_ratio_range=ink_ratio_range,
+                    debug=debug,
+                    video_prefix=p.stem,
+                    save_original=save_original,
+                    skip_blur=skip_blur,
+                )
                 print(f"Processed {p.name} -> saved {saved} frames")
                 processed += 1
     print(f"process_videos_in_dir: processed={processed} skipped={skipped}")
@@ -390,9 +426,69 @@ class HandwritingCRNN(nn.Module):
         return output
 
 
+# Module-level dataset classes to avoid multiprocessing pickling issues on Windows
+if torch is not None:
+    class OCRDataset(Dataset):
+        def __init__(self, items, label_to_idx, target_size, is_training=False):
+            self.items = items
+            self.label_to_idx = label_to_idx
+            self.target_size = target_size
+            self.is_training = is_training
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, idx):
+            path, label = self.items[idx]
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise RuntimeError(f"Failed to read image {path}")
+
+            # Ensure target size (height, width)
+            img = cv2.resize(img, (self.target_size[1], self.target_size[0]),
+                               interpolation=cv2.INTER_AREA)
+
+            img = torch.from_numpy(img).unsqueeze(0).float() / 255.0
+            img = (img - 0.5) / 0.5
+
+            if self.is_training and random.random() < 0.3:
+                noise = torch.randn_like(img) * 0.1
+                img = img + noise
+                img = torch.clamp(img, -1, 1)
+
+            return img, self.label_to_idx[label]
+
+    class EvalDataset(Dataset):
+        def __init__(self, items, label_to_idx, target_size):
+            self.items = items
+            self.label_to_idx = label_to_idx
+            self.target_size = target_size
+
+        def __len__(self):
+            return len(self.items)
+
+        def __getitem__(self, idx):
+            path, label = self.items[idx]
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise RuntimeError(f"Failed to read image {path}")
+
+            img = cv2.resize(img, (self.target_size[1], self.target_size[0]),
+                           interpolation=cv2.INTER_AREA)
+            img = torch.from_numpy(img).unsqueeze(0).float() / 255.0
+            img = (img - 0.5) / 0.5
+
+            return img, self.label_to_idx[label], path
+else:
+    # Placeholders so module can be imported for preprocessing without torch
+    OCRDataset = None
+    EvalDataset = None
+
+
 def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cpu",
                 val_split=0.15, test_split=0.15, model_name="enhanced_cnn",
-                target_size=(64, 256), early_stopping_patience=10):
+                target_size=(64, 256), early_stopping_patience=10, split_by_video=False,
+                resume_from=None):
     """Enhanced training function with better hyperparameters and techniques."""
     if torch is None:
         raise RuntimeError("PyTorch not installed. Install packages from requirements.txt before training.")
@@ -428,118 +524,84 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
     label_counts = Counter(label for _, label in items)
     print(f"Class distribution: {dict(label_counts)}")
 
-    # Create balanced splits
+    # Create balanced splits. Optionally split by video (folder-level) to avoid leakage
     labels = sorted({lab for _, lab in items})
     label_to_idx = {lab: i for i, lab in enumerate(labels)}
 
-    # Stratified splitting
-    label_items = {}
-    for item in items:
-        path, label = item
-        if label not in label_items:
-            label_items[label] = []
-        label_items[label].append(item)
-
     train_items, val_items, test_items = [], [], []
-    for label, label_item_list in label_items.items():
-        random.shuffle(label_item_list)
-        n = len(label_item_list)
 
-        # Robust stratified splitting for small n
-        if n == 1:
-            n_train, n_val, n_test = 1, 0, 0
-        elif n == 2:
-            n_train, n_val, n_test = 1, 1, 0
-        else:
-            # Start with proportional allocation, then adjust to ensure >=1 train
-            n_test = max(1, int(round(n * test_split)))
-            n_val = max(1, int(round(n * val_split)))
+    if split_by_video:
+        # Group items by label -> video prefix (assumes filenames start with '<video>_')
+        label_video_map = {}
+        for path, label in items:
+            name = Path(path).name
+            # infer video id from filename prefix before first '_frame_' or first '_'
+            vid = None
+            if '_frame_' in name:
+                vid = name.split('_frame_')[0]
+            else:
+                vid = name.split('_')[0]
+
+            label_video_map.setdefault(label, {}).setdefault(vid, []).append((path, label))
+
+        for label, vid_map in label_video_map.items():
+            vids = list(vid_map.keys())
+            random.shuffle(vids)
+            n_vids = len(vids)
+            n_test_vids = max(1, int(n_vids * test_split))
+            n_val_vids = max(1, int(n_vids * val_split))
+            n_train_vids = n_vids - n_val_vids - n_test_vids
+
+            train_vids = vids[:n_train_vids]
+            val_vids = vids[n_train_vids:n_train_vids + n_val_vids]
+            test_vids = vids[n_train_vids + n_val_vids:]
+
+            for v in train_vids:
+                train_items.extend(vid_map[v])
+            for v in val_vids:
+                val_items.extend(vid_map[v])
+            for v in test_vids:
+                test_items.extend(vid_map[v])
+    else:
+        # Stratified splitting at image level
+        label_items = {}
+        for item in items:
+            path, label = item
+            label_items.setdefault(label, []).append(item)
+
+        for label, label_item_list in label_items.items():
+            random.shuffle(label_item_list)
+            n = len(label_item_list)
+            n_test = max(1, int(n * test_split))
+            n_val = max(1, int(n * val_split))
             n_train = n - n_val - n_test
 
-            # If no room for training examples, reduce val/test counts
-            if n_train < 1:
-                deficit = 1 - n_train
-                # prefer reducing validation first
-                reduce_val = min(deficit, n_val)
-                n_val -= reduce_val
-                deficit -= reduce_val
-                if deficit > 0:
-                    reduce_test = min(deficit, n_test)
-                    n_test -= reduce_test
-                    deficit -= reduce_test
-                n_train = n - n_val - n_test
-
-            # Final safety clamps
-            n_train = max(1, n_train)
-            n_val = max(0, n_val)
-            n_test = max(0, n_test)
-
-            # If rounding caused sum mismatch, fix by adjusting test
-            total_assigned = n_train + n_val + n_test
-            if total_assigned != n:
-                # adjust test to absorb difference
-                diff = n - total_assigned
-                n_test = max(0, n_test + diff)
-
-        # Slice the shuffled list
-        train_items.extend(label_item_list[:n_train])
-        val_items.extend(label_item_list[n_train:n_train + n_val])
-        test_items.extend(label_item_list[n_train + n_val: n_train + n_val + n_test])
+            train_items.extend(label_item_list[:n_train])
+            val_items.extend(label_item_list[n_train:n_train + n_val])
+            test_items.extend(label_item_list[n_train + n_val:])
 
     print(f"Dataset: {len(items)} images — train={len(train_items)}, val={len(val_items)}, test={len(test_items)} — classes={len(labels)}")
 
-    class OCRDataset(Dataset):
-        def __init__(self, items, label_to_idx, target_size, is_training=False):
-            self.items = items
-            self.label_to_idx = label_to_idx
-            self.target_size = target_size
-            self.is_training = is_training
-
-        def __len__(self):
-            return len(self.items)
-
-        def __getitem__(self, idx):
-            path, label = self.items[idx]
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                raise RuntimeError(f"Failed to read image {path}")
-
-            # Ensure target size
-            img = cv2.resize(img, (self.target_size[1], self.target_size[0]),
-                           interpolation=cv2.INTER_AREA)
-
-            # Convert to tensor and normalize
-            img = torch.from_numpy(img).unsqueeze(0).float() / 255.0
-
-            # Enhanced normalization for better convergence
-            img = (img - 0.5) / 0.5  # Normalize to [-1, 1]
-
-            # Additional augmentation during training
-            if self.is_training and random.random() < 0.3:
-                # Random noise
-                noise = torch.randn_like(img) * 0.1
-                img = img + noise
-                img = torch.clamp(img, -1, 1)
-
-            return img, self.label_to_idx[label]
-
+    # Create datasets using module-level classes (avoids Windows multiprocessing pickling issues)
     train_ds = OCRDataset(train_items, label_to_idx, target_size, is_training=True)
     val_ds = OCRDataset(val_items, label_to_idx, target_size, is_training=False)
     test_ds = OCRDataset(test_items, label_to_idx, target_size, is_training=False)
 
-    # Enhanced data loaders with better sampling
-    # Use num_workers=0 to avoid pickling issues on Windows when dataset classes are local
-    num_workers = 0
-    pin_memory = True if device.type == 'cuda' else False
+    device = torch.device(device_str)
+    print(f"Using device: {device}")
+
+    # DataLoader worker/pin settings: on Windows use num_workers=0 to avoid spawn/pickle issues
+    is_windows = os.name == 'nt'
+    num_workers = 0 if is_windows else 2
+    pin_memory = True if (device.type == 'cuda') else False
+
+    # Enhanced data loaders with safer defaults
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                             num_workers=num_workers, pin_memory=pin_memory, drop_last=False)
+                             num_workers=num_workers, pin_memory=pin_memory, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                            num_workers=num_workers, pin_memory=pin_memory)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=pin_memory)
-
-    device = torch.device(device_str)
-    print(f"Using device: {device}")
 
     # Build enhanced model
     if model_name == "enhanced_cnn":
@@ -585,7 +647,8 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
 
     # Enhanced optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True)
+    # Avoid passing verbose to keep compatibility with older PyTorch versions
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5)
     criterion = nn.CrossEntropyLoss()
 
     # Training loop with early stopping
@@ -595,7 +658,32 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
 
     print(f"Starting training with {model.__class__.__name__} for {epochs} epochs...")
 
-    for epoch in range(1, epochs + 1):
+    # Resume support: if a checkpoint path is provided, attempt to restore model/optimizer/scheduler
+    start_epoch = 1
+    if resume_from:
+        try:
+            print(f"Loading checkpoint to resume from: {resume_from}")
+            ckpt = torch.load(resume_from, map_location=device)
+            if 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+            if 'optimizer_state_dict' in ckpt:
+                try:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                except Exception as e:
+                    print(f"Warning: failed to load optimizer state: {e}")
+            if 'scheduler_state_dict' in ckpt:
+                try:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                except Exception as e:
+                    print(f"Warning: failed to load scheduler state: {e}")
+
+            best_val_acc = ckpt.get('val_acc', best_val_acc)
+            start_epoch = ckpt.get('epoch', 0) + 1
+            print(f"Resuming from epoch {start_epoch} (best_val_acc={best_val_acc:.4f})")
+        except Exception as e:
+            print(f"Failed to load checkpoint '{resume_from}': {e}. Starting from scratch.")
+
+    for epoch in range(start_epoch, epochs + 1):
         # Training phase
         model.train()
         running_loss = 0.0
@@ -620,8 +708,8 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += target.size(0)
 
-        train_loss = running_loss / (len(train_loader) if len(train_loader) > 0 else 1)
-        train_acc = correct / (total if total > 0 else 1)
+        train_loss = running_loss / len(train_loader)
+        train_acc = correct / total
 
         # Validation phase
         model.eval()
@@ -638,11 +726,8 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
                 val_correct += pred.eq(target.view_as(pred)).sum().item()
                 val_total += target.size(0)
 
-        if len(val_loader) > 0:
-            val_loss /= len(val_loader)
-        else:
-            val_loss = 0.0
-        val_acc = val_correct / val_total if val_total > 0 else 0.0
+        val_loss /= len(val_loader)
+        val_acc = val_correct / val_total
 
         # Store metrics
         train_losses.append(train_loss)
@@ -700,7 +785,7 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
             predictions.extend(pred.cpu().numpy())
             true_labels.extend(target.cpu().numpy())
 
-    test_acc = test_correct / test_total if test_total > 0 else 0.0
+    test_acc = test_correct / test_total
     print(f"\nFinal Results:")
     print(f"Best Validation Accuracy: {best_val_acc:.4f}")
     print(f"Test Accuracy: {test_acc:.4f}")
@@ -724,6 +809,30 @@ def run_training(dataset_root, epochs=50, batch_size=16, lr=1e-3, device_str="cp
     return best_val_acc, test_acc
 
 
+def dataset_summary(dataset_root):
+    """Print a short summary of the dataset directory: per-label image counts and CSV checks."""
+    root = Path(dataset_root)
+    if not root.exists() or not root.is_dir():
+        print(f"Dataset root does not exist: {root}")
+        return
+
+    total = 0
+    print(f"Scanning dataset root: {root}\n")
+    for subdir in sorted(p for p in root.iterdir() if p.is_dir()):
+        pngs = list(subdir.glob('*.png'))
+        csvf = subdir / 'labels.csv'
+        n_png = len(pngs)
+        total += n_png
+        has_csv = csvf.exists()
+        # Quick duplicate filename check (within folder)
+        names = [p.name for p in pngs]
+        dup_count = len(names) - len(set(names))
+        print(f"Label: {subdir.name}: {n_png} images; labels.csv={'yes' if has_csv else 'no'}; dup_filenames={dup_count}")
+
+    print(f"\nTotal images: {total}")
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Enhanced handwriting OCR preprocessing and training.")
     sub = parser.add_subparsers(dest="cmd", required=False)
@@ -737,6 +846,8 @@ if __name__ == "__main__":
     p_pre.add_argument("--no-dedupe", dest="dedupe", action="store_false", help="Disable deduplication during preprocessing")
     p_pre.add_argument("--dedupe-thresh", dest="dedupe_thresh", type=int, default=12, help="Hamming threshold for dedupe")
     p_pre.add_argument("--max-frames-per-video", dest="max_frames", type=int, default=None, help="Cap saved frames per video")
+    p_pre.add_argument("--save-original", dest="save_original", action="store_true", help="Save raw grayscale frame alongside processed image")
+    p_pre.add_argument("--skip-blur", dest="skip_blur", action="store_true", help="Skip Gaussian blur in preprocessing (crisper output)")
 
     p_train = sub.add_parser("train", help="Train enhanced handwriting OCR classifier")
     p_train.add_argument("dataset_root", help="Path to dataset root (each subfolder=label or CSVs)")
@@ -750,6 +861,8 @@ if __name__ == "__main__":
                         default="enhanced_cnn", help="Model architecture to use")
     p_train.add_argument("--target-size", nargs=2, type=int, default=[64, 256], help="Target image size (height width)")
     p_train.add_argument("--early-stopping", type=int, default=10, help="Early stopping patience")
+    p_train.add_argument("--split-by-video", action="store_true", help="Split dataset by source video (avoid leakage)")
+    p_train.add_argument("--resume-from", dest="resume_from", help="Path to checkpoint (.pth) to resume training from")
 
     p_pipe = sub.add_parser("pipeline", help="Complete pipeline: preprocess videos and train model")
     p_pipe.add_argument("input_dir", help="Directory containing videos to process")
@@ -770,6 +883,13 @@ if __name__ == "__main__":
                         default="enhanced_cnn", help="Model architecture to use")
     p_pipe.add_argument("--early-stopping", type=int, default=10, help="Early stopping patience")
     p_pipe.add_argument("--force", action="store_true", help="Force overwrite existing dataset")
+    p_pipe.add_argument("--sharpness-thresh", type=float, default=10.0, help="Sharpness threshold (lower = more lenient)")
+    p_pipe.add_argument("--ink-ratio-min", type=float, default=0.005, help="Minimum ink ratio")
+    p_pipe.add_argument("--ink-ratio-max", type=float, default=0.8, help="Maximum ink ratio")
+    p_pipe.add_argument("--split-by-video", action="store_true", help="Split dataset by source video (avoid leakage)")
+    p_pipe.add_argument("--save-original", dest="save_original", action="store_true", help="Save raw grayscale frame alongside processed image")
+    p_pipe.add_argument("--skip-blur", dest="skip_blur", action="store_true", help="Skip Gaussian blur in preprocessing (crisper output)")
+    p_pipe.add_argument("--resume-from", dest="resume_from", help="Path to checkpoint (.pth) to resume training from")
 
     p_eval = sub.add_parser("evaluate", help="Evaluate a trained model on test data")
     p_eval.add_argument("model_path", help="Path to saved model (.pth file)")
@@ -777,6 +897,21 @@ if __name__ == "__main__":
     p_eval.add_argument("--batch-size", type=int, default=32, help="Batch size for evaluation")
     p_eval.add_argument("--device", default="cuda" if torch and torch.cuda.is_available() else "cpu", help="Device to use")
     p_eval.add_argument("--target-size", nargs=2, type=int, default=[64, 256], help="Target image size (height width)")
+
+    p_test = sub.add_parser("test-video", help="Test video processing on a single video with verbose output")
+    p_test.add_argument("video", help="Path to input video file")
+    p_test.add_argument("out", help="Output directory for processed frames")
+    p_test.add_argument("--fps", type=float, default=2.0, help="Frame sampling rate")
+    p_test.add_argument("--target-size", nargs=2, type=int, default=[64, 256], help="Target image size (height width)")
+    p_test.add_argument("--sharpness-thresh", type=float, default=5.0, help="Sharpness threshold (lower = more lenient)")
+    p_test.add_argument("--ink-ratio-min", type=float, default=0.001, help="Minimum ink ratio")
+    p_test.add_argument("--ink-ratio-max", type=float, default=0.9, help="Maximum ink ratio")
+    p_test.add_argument("--max-frames", type=int, default=50, help="Maximum frames to process for testing")
+    p_test.add_argument("--save-original", dest="save_original", action="store_true", help="Save raw grayscale frame alongside processed image")
+    p_test.add_argument("--skip-blur", dest="skip_blur", action="store_true", help="Skip Gaussian blur in preprocessing (crisper output)")
+
+    p_ds = sub.add_parser("dataset-summary", help="Show per-label image counts and quick dataset checks")
+    p_ds.add_argument("dataset_root", help="Path to dataset root to summarize")
 
     args = parser.parse_args()
 
@@ -787,6 +922,8 @@ if __name__ == "__main__":
         target_size = (64, 256)
 
     if args.cmd == "preprocess":
+        # Use the video filename stem as the prefix so frames are grouped by source video
+        video_prefix = Path(args.video).stem
         saved_frames = process_video(
             args.video, args.out,
             fps=args.fps,
@@ -794,7 +931,10 @@ if __name__ == "__main__":
             augment=args.augment,
             dedupe=args.dedupe,
             dedupe_hamming_thresh=args.dedupe_thresh,
-            max_frames_per_video=args.max_frames
+            max_frames_per_video=args.max_frames,
+            video_prefix=video_prefix,
+            save_original=getattr(args, 'save_original', False),
+            skip_blur=getattr(args, 'skip_blur', False),
         )
         print(f"Preprocessing completed. Saved {saved_frames} frames.")
 
@@ -814,7 +954,9 @@ if __name__ == "__main__":
             test_split=args.test_split,
             model_name=args.model,
             target_size=target_size,
-            early_stopping_patience=args.early_stopping
+            early_stopping_patience=args.early_stopping,
+            split_by_video=getattr(args, 'split_by_video', False),
+            resume_from=getattr(args, 'resume_from', None)
         )
 
         print(f"\n=== Training Complete ===")
@@ -842,7 +984,12 @@ if __name__ == "__main__":
             target_size=target_size,
             dedupe=args.dedupe,
             dedupe_hamming_thresh=args.dedupe_thresh,
-            max_frames_per_video=args.max_frames
+            max_frames_per_video=args.max_frames,
+            sharpness_thresh=args.sharpness_thresh,
+            ink_ratio_range=(args.ink_ratio_min, args.ink_ratio_max),
+            debug=False,
+            save_original=getattr(args, 'save_original', False),
+            skip_blur=getattr(args, 'skip_blur', False),
         )
 
         if processed == 0:
@@ -867,7 +1014,9 @@ if __name__ == "__main__":
             test_split=args.test_split,
             model_name=args.model,
             target_size=target_size,
-            early_stopping_patience=args.early_stopping
+            early_stopping_patience=args.early_stopping,
+            split_by_video=getattr(args, 'split_by_video', False),
+            resume_from=getattr(args, 'resume_from', None)
         )
 
         print(f"\n=== Pipeline Complete ===")
@@ -1028,11 +1177,54 @@ if __name__ == "__main__":
             for path, true_label, pred_label in misclassified[:10]:
                 print(f"  {Path(path).name}: True={true_label}, Predicted={pred_label}")
 
+    elif args.cmd == "test-video":
+        print("Testing video processing with verbose output...")
+        target_size = tuple(args.target_size) if hasattr(args, 'target_size') and args.target_size else (64, 256)
+
+        saved_frames = process_video(
+            args.video, args.out,
+            fps=args.fps,
+            target_size=target_size,
+            sharpness_thresh=args.sharpness_thresh,
+            ink_ratio_range=(args.ink_ratio_min, args.ink_ratio_max),
+            augment=0,  # No augmentation for testing
+            dedupe=False,  # No deduplication for testing
+            max_frames_per_video=args.max_frames,
+            debug=True,  # Enable debug output for test-video
+            save_original=getattr(args, 'save_original', False),
+            skip_blur=getattr(args, 'skip_blur', False),
+        )
+        print(f"Test completed. Saved {saved_frames} frames to {args.out}")
+
+        # Show some sample images if any were saved
+        out_path = Path(args.out)
+        sample_images = list(out_path.glob("*.png"))[:5]
+        if sample_images:
+            print(f"\nSample images saved:")
+            for img_path in sample_images:
+                print(f"  {img_path}")
+        else:
+            print("\nNo images were saved. Try adjusting the thresholds:")
+            print(f"  --sharpness-thresh (current: {args.sharpness_thresh}, try lower like 1.0)")
+            print(f"  --ink-ratio-min (current: {args.ink_ratio_min}, try lower like 0.0001)")
+            print(f"  --ink-ratio-max (current: {args.ink_ratio_max}, try higher like 0.95)")
+
+    elif args.cmd == "dataset-summary":
+        dataset_summary(args.dataset_root)
+
     else:
         print("No command provided or invalid command.")
-        print("Available commands: preprocess, train, pipeline, evaluate")
+        print("Available commands: preprocess, train, pipeline, evaluate, test-video")
         print("Use --help for detailed usage information.")
         print("\nExample usage:")
-        print("  python script.py pipeline input_videos/ dataset/ --model enhanced_cnn --epochs 50")
-        print("  python script.py train dataset/ --model enhanced_cnn --batch-size 16")
-        print("  python script.py evaluate best_handwriting_ocr_model.pth dataset/")
+        print("  # Test a single video first to check if processing works:")
+        print("  python train.py test-video Abbreviation/some_video.mp4 test_output/")
+        print("  ")
+        print("  # Run full pipeline:")
+        print("  python train.py pipeline . dataset/ --model enhanced_cnn --epochs 50")
+        print("  ")
+        print("  # Train only:")
+        print("  python train.py train dataset/ --model enhanced_cnn --batch-size 16")
+        print("  ")
+        print("  # Evaluate a model:")
+        print("  python train.py evaluate best_handwriting_ocr_model.pth dataset/")

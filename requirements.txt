@@ -1,4 +1,39 @@
-opencv-python
-numpy
-torch
-torchvision
+# Core dependencies for YOLO + CRNN OCR Pipeline
+# Install with: pip install -r requirements.txt
+
+# Deep Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+
+# YOLO (Ultralytics YOLOv8)
+ultralytics>=8.0.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Image Processing
+Pillow>=9.5.0
+
+# Progress Bars & Utilities
+tqdm>=4.65.0
+
+# Data Handling
+pandas>=2.0.0
+
+# Configuration & Logging
+PyYAML>=6.0
+
+# Optional but recommended for faster training
+# psutil>=5.9.0
+# matplotlib>=3.7.0
+# seaborn>=0.12.0
+
+# For GPU support, install CUDA-enabled PyTorch:
+# Visit: https://pytorch.org/get-started/locally/
+# Example for CUDA 11.8:
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu118
