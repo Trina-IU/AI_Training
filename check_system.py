@@ -32,7 +32,7 @@ print("\n2. Checking PyTorch...")
 try:
     import torch
     print(f"   ✓ PyTorch {torch.__version__}")
-    
+
     # Check CUDA
     if torch.cuda.is_available():
         print(f"   ✓ CUDA available: {torch.cuda.get_device_name(0)}")
@@ -101,16 +101,22 @@ optional_packages = {
     'pandas': 'Data handling',
     'matplotlib': 'Visualization',
     'tqdm': 'Progress bars',
-    'Pillow': 'Image processing'
+    'PIL': ('Pillow', 'Image processing')  # PIL is the import name for Pillow
 }
 
-for package, description in optional_packages.items():
+for import_name, info in optional_packages.items():
+    if isinstance(info, tuple):
+        package_name, description = info
+    else:
+        package_name = import_name
+        description = info
+    
     try:
-        __import__(package)
-        print(f"   ✓ {package} ({description})")
+        __import__(import_name)
+        print(f"   ✓ {package_name} ({description})")
     except ImportError:
-        print(f"   ⚠ {package} not installed ({description})")
-        warnings.append(f"{package} not installed - {description}")
+        print(f"   ⚠ {package_name} not installed ({description})")
+        warnings.append(f"{package_name} not installed - {description}")
 
 # Check disk space
 print("\n8. Checking disk space...")
