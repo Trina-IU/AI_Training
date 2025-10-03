@@ -502,6 +502,7 @@ def main():
     parser.add_argument('--fallback-cc', action='store_true', help='Use connected-components fallback when YOLO finds no boxes')
     parser.add_argument('--cc-min-area', type=int, default=50, help='Fallback CC minimum box area')
     parser.add_argument('--cc-max-area', type=int, default=50000, help='Fallback CC maximum box area')
+    parser.add_argument('--recursive', action='store_true', help='Recursively scan image-dir for images')
 
     args = parser.parse_args()
 
@@ -534,6 +535,9 @@ def main():
     # Process images
     results = []
 
+    # Ensure output directory exists even if there are zero images
+    Path(args.output).mkdir(parents=True, exist_ok=True)
+
     if args.image:
         # Debug: show process_image signature and origin
         try:
@@ -553,7 +557,11 @@ def main():
 
     elif args.image_dir:
         img_dir = Path(args.image_dir)
-        image_files = list(img_dir.glob('*.png')) + list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.jpeg'))
+        if args.recursive:
+            exts = {'.png', '.jpg', '.jpeg'}
+            image_files = [p for p in img_dir.rglob('*') if p.suffix.lower() in exts]
+        else:
+            image_files = list(img_dir.glob('*.png')) + list(img_dir.glob('*.jpg')) + list(img_dir.glob('*.jpeg'))
         print(f"\nFound {len(image_files)} images in {img_dir}")
 
         for img_path in image_files:
