@@ -194,6 +194,18 @@ def load_ocr_model(checkpoint_path, device='cpu'):
     """Load CRNN model from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location='cpu')
     idx_to_char = ckpt['idx_to_char']
+    # Normalize idx_to_char to a dict with integer keys
+    if isinstance(idx_to_char, list):
+        idx_to_char = {i: ch for i, ch in enumerate(idx_to_char)}
+    elif isinstance(idx_to_char, dict):
+        # Convert string keys to ints if needed
+        sample_key = next(iter(idx_to_char.keys())) if len(idx_to_char) > 0 else None
+        if isinstance(sample_key, str):
+            try:
+                idx_to_char = {int(k): v for k, v in idx_to_char.items()}
+            except Exception:
+                # Leave as-is if conversion fails
+                pass
     n_classes = len(idx_to_char)
 
     # Try to load with attention model first
@@ -248,9 +260,29 @@ def greedy_decode(logits, idx_to_char):
     return ''.join(decoded)
 
 
+def _fallback_connected_components(img_bgr, min_area=50, max_area=50000):
+    """Simple connected-components based region proposal as fallback."""
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        gray = img_bgr if img_bgr.ndim == 2 else cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    dilated = cv2.dilate(binary, kernel, iterations=2)
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        if min_area < area < max_area:
+            boxes.append([x, y, x + w, y + h])
+    return boxes
+
+
 def detect_and_recognize(image_path, yolo_model, ocr_model, idx_to_char, device='cpu',
                         conf_threshold=0.25, iou_threshold=0.45, imgsz=640,
-                        target_size=(64, 256), preprocess=False, output_dir=None):
+                        target_size=(64, 256), preprocess=False, output_dir=None, yolo_save=False,
+                        fallback_cc=False, cc_min_area=50, cc_max_area=50000):
     """
     Main pipeline: detect text regions with YOLO, then recognize with CRNN.
 
@@ -298,11 +330,62 @@ def detect_and_recognize(image_path, yolo_model, ocr_model, idx_to_char, device=
                 print(f"Warning: could not save debug images: {e}")
 
     # Step 1: Detect text regions with YOLO
-    results = yolo_model.predict(img_for_detect, conf=conf_threshold, iou=iou_threshold, imgsz=imgsz, verbose=False)
+    if yolo_save and output_dir is not None:
+        results = yolo_model.predict(
+            img_for_detect,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            imgsz=imgsz,
+            device=str(device),
+            verbose=False,
+            save=True,
+            project=str(Path(output_dir)),
+            name='yolo_debug'
+        )
+    else:
+        results = yolo_model.predict(
+            img_for_detect,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            imgsz=imgsz,
+            device=str(device),
+            verbose=False
+        )
+
+    # Debug: print number of boxes and top confidences
+    try:
+        num_boxes = 0 if len(results) == 0 else len(results[0].boxes)
+        print(f"YOLO detected {num_boxes} boxes")
+        if num_boxes > 0:
+            confs = [float(c) for c in results[0].boxes.conf.cpu().numpy().tolist()]
+            print(f"Top confidences: {confs[:5]}")
+    except Exception:
+        pass
 
     if len(results) == 0 or len(results[0].boxes) == 0:
         print(f"No text regions detected in {image_path}")
-        return []
+        if not fallback_cc:
+            return []
+        # Fallback: generate proposals via connected components
+        cc_boxes = _fallback_connected_components(img_for_detect, min_area=cc_min_area, max_area=cc_max_area)
+        print(f"Fallback CC generated {len(cc_boxes)} boxes")
+        results_boxes = []
+        for b in cc_boxes:
+            results_boxes.append({'xyxy': b, 'conf': 0.01})
+        # Process fallback boxes below using same flow
+        detections = []
+        for b in cc_boxes:
+            x1, y1, x2, y2 = map(int, b)
+            conf = 0.01
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            crop_tensor = preprocess_crop_for_ocr(crop, target_size).to(device)
+            with torch.no_grad():
+                logits = ocr_model(crop_tensor)
+            text = greedy_decode(logits, idx_to_char)
+            detections.append({'box': [x1, y1, x2, y2], 'text': text, 'confidence': conf})
+        return detections
 
     detections = []
 
@@ -362,14 +445,16 @@ def visualize_results(image_path, detections, output_path):
 
 
 def process_image(image_path, yolo_model, ocr_model, idx_to_char, output_dir,
-                 device='cpu', visualize=False, conf_threshold=0.25, iou_threshold=0.45, imgsz=640, preprocess=False):
+                 device='cpu', visualize=False, conf_threshold=0.25, iou_threshold=0.45, imgsz=640, preprocess=False, yolo_save=False,
+                 fallback_cc=False, cc_min_area=50, cc_max_area=50000):
     """Process a single image through the pipeline."""
     print(f"\nProcessing: {image_path}")
 
     detections = detect_and_recognize(
         image_path, yolo_model, ocr_model, idx_to_char,
         device=device, conf_threshold=conf_threshold, iou_threshold=iou_threshold, imgsz=imgsz,
-        preprocess=preprocess, output_dir=output_dir
+        preprocess=preprocess, output_dir=output_dir, yolo_save=yolo_save,
+        fallback_cc=fallback_cc, cc_min_area=cc_min_area, cc_max_area=cc_max_area
     )
 
     # Save results as JSON
@@ -410,9 +495,13 @@ def main():
     parser.add_argument('--iou', type=float, default=0.45, help='YOLO IoU threshold')
     parser.add_argument('--imgsz', type=int, default=640, help='YOLO image size')
     parser.add_argument('--visualize', action='store_true', help='Save visualization images')
+    parser.add_argument('--yolo-save', action='store_true', help='Save YOLO debug images to output')
     parser.add_argument('--target-h', type=int, default=64, help='OCR target height')
     parser.add_argument('--target-w', type=int, default=256, help='OCR target width')
     parser.add_argument('--preprocess', action='store_true', help='Apply image enhancement before YOLO detection')
+    parser.add_argument('--fallback-cc', action='store_true', help='Use connected-components fallback when YOLO finds no boxes')
+    parser.add_argument('--cc-min-area', type=int, default=50, help='Fallback CC minimum box area')
+    parser.add_argument('--cc-max-area', type=int, default=50000, help='Fallback CC maximum box area')
 
     args = parser.parse_args()
 
@@ -457,7 +546,8 @@ def main():
         result = process_image(
             args.image, yolo_model, ocr_model, idx_to_char, args.output,
             device=device, visualize=args.visualize, conf_threshold=args.conf, iou_threshold=args.iou, imgsz=args.imgsz,
-            preprocess=args.preprocess
+            preprocess=args.preprocess, yolo_save=args.yolo_save,
+            fallback_cc=args.fallback_cc, cc_min_area=args.cc_min_area, cc_max_area=args.cc_max_area
         )
         results.append(result)
 
@@ -478,7 +568,8 @@ def main():
             result = process_image(
                 img_path, yolo_model, ocr_model, idx_to_char, args.output,
                 device=device, visualize=args.visualize, conf_threshold=args.conf, iou_threshold=args.iou, imgsz=args.imgsz,
-                preprocess=args.preprocess
+                preprocess=args.preprocess, yolo_save=args.yolo_save,
+                fallback_cc=args.fallback_cc, cc_min_area=args.cc_min_area, cc_max_area=args.cc_max_area
             )
             results.append(result)
 
