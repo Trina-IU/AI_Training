@@ -122,17 +122,18 @@ class ExportWrapper(nn.Module):
         # x: [1,1,H,W]
         logits = self.model(x)  # [T, N, C]
         probs = torch.softmax(logits, dim=2)
-        seq = torch.argmax(probs, dim=2).squeeze(1).cpu().numpy().tolist()
+        seq = torch.argmax(probs, dim=2).squeeze(1)  # [T]
         # collapse repeats and remove blanks -> return indices as LongTensor
-        out_inds = []
         prev = -1
-        for s in seq:
+        out_list: List[int] = []  # type: ignore[name-defined]
+        for i in range(seq.size(0)):
+            s = int(seq[i].item())
             if s != prev and s != 0:
-                out_inds.append(int(s))
+                out_list.append(s)
             prev = s
-        if len(out_inds) == 0:
+        if len(out_list) == 0:
             return torch.empty((0,), dtype=torch.int64)
-        return torch.tensor(out_inds, dtype=torch.int64)
+        return torch.tensor(out_list, dtype=torch.int64)
 
 
 def main():
